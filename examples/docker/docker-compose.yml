@@ -1,0 +1,48 @@
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: tds_cdc_sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+      MSSQL_AGENT_ENABLED: "true"
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test: >
+        /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "YourStrong!Passw0rd" -C -No -Q "SELECT 1"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  sqlserver-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: tds_cdc_init
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      SA_PASSWORD: "YourStrong!Passw0rd"
+      SQL_HOST: sqlserver
+      SQL_PORT: "1433"
+      SQL_USER: sa
+    volumes:
+      - ./sqlserver/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./sqlserver/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+
+  app:
+    build:
+      context: ../..
+      dockerfile: examples/docker/app/Dockerfile
+    container_name: tds_cdc_app
+    depends_on:
+      sqlserver-init:
+        condition: service_completed_successfully
+    environment:
+      TDS_HOST: sqlserver
+      TDS_PORT: "1433"
+      TDS_USERNAME: sa
+      TDS_PASSWORD: "YourStrong!Passw0rd"
+      TDS_DATABASE: cdc_test

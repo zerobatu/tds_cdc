@@ -8,6 +8,34 @@ defmodule TdsCdc.Lsn do
   """
 
   @doc """
+  Compares two LSN binary values.
+
+  Returns `:lt`, `:eq`, or `:gt` similar to `Enum.sort/2`.
+
+  SQL Server LSNs are `binary(10)` values that sort lexicographically,
+  which corresponds to their chronological order in the transaction log.
+
+  ## Examples
+
+      iex> TdsCdc.Lsn.compare(<<0,0,0,1,0,0,0,0,0,1>>, <<0,0,0,2,0,0,0,0,0,1>>)
+      :lt
+
+      iex> TdsCdc.Lsn.compare(<<0,0,0,2,0,0,0,0,0,1>>, <<0,0,0,1,0,0,0,0,0,1>>)
+      :gt
+
+      iex> TdsCdc.Lsn.compare(<<0,0,0,1,0,0,0,0,0,1>>, <<0,0,0,1,0,0,0,0,0,1>>)
+      :eq
+  """
+  @spec compare(binary(), binary()) :: :lt | :eq | :gt
+  def compare(lsn_a, lsn_b) do
+    cond do
+      lsn_a < lsn_b -> :lt
+      lsn_a > lsn_b -> :gt
+      true -> :eq
+    end
+  end
+
+  @doc """
   Converts a binary LSN from SQL Server to a hex string representation.
 
   SQL Server stores LSNs as `binary(10)`, which is 10 bytes. This function
@@ -72,7 +100,7 @@ defmodule TdsCdc.Lsn do
 
   @doc """
   Builds the SQL query to get all changes for a capture instance
-  starting from the given LSN.
+  between two LSN values (inclusive endpoints).
   """
   @spec all_changes_query(String.t(), binary(), binary()) :: String.t()
   def all_changes_query(capture_instance, from_lsn, to_lsn) do
@@ -81,20 +109,5 @@ defmodule TdsCdc.Lsn do
 
     "SELECT * FROM cdc.fn_cdc_get_all_changes_#{capture_instance}(" <>
       "0x#{from_hex}, 0x#{to_hex}, 'all')"
-  end
-
-  @doc """
-  Builds the SQL query to get all changes for a capture instance
-  from a given LSN up to the current max LSN.
-
-  The `from_lsn` should be exclusive (changes after this LSN).
-  """
-  @spec changes_since_query(String.t(), binary()) :: String.t()
-  def changes_since_query(capture_instance, from_lsn) do
-    from_hex = Base.encode16(from_lsn)
-
-    "DECLARE @from_lsn binary(10) = 0x#{from_hex}, @to_lsn binary(10) = sys.fn_cdc_get_max_lsn(); " <>
-      "SELECT * FROM cdc.fn_cdc_get_all_changes_#{capture_instance}(" <>
-      "sys.fn_cdc_increment_lsn(@from_lsn), @to_lsn, 'all')"
   end
 end

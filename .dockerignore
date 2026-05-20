@@ -1,0 +1,9 @@
+_build
+deps
+doc
+tmp
+.credo
+.dialyzer
+.coverage
+*.ez
+tds_cdc-*.tar

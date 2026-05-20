@@ -8,6 +8,8 @@ defmodule TdsCdc.Capture do
   - Fetching changes from CDC tables
   """
 
+  require Logger
+
   alias TdsCdc.{Change, Lsn}
 
   @doc """
@@ -37,26 +39,57 @@ defmodule TdsCdc.Capture do
   @doc """
   Fetches all changes from a capture instance since the given LSN.
 
+  This function performs three queries:
+  1. Get the current max LSN
+  2. Increment the from_lsn (since CDC functions are inclusive)
+  3. Query the CDC change table function
+
   Returns `{:ok, changes}` with a list of `%Change{}` structs, or `{:error, reason}`.
-  The `from_lsn` should be a binary LSN value; changes after this LSN will be returned.
   """
   @spec fetch_changes(GenServer.server(), String.t(), binary()) ::
           {:ok, [Change.t()]} | {:error, term()}
   def fetch_changes(conn, capture_instance, from_lsn) do
-    query = Lsn.changes_since_query(capture_instance, from_lsn)
+    Logger.debug("Fetching changes for #{capture_instance} from LSN #{Lsn.to_hex(from_lsn)}")
 
-    case Tds.query(conn, query, []) do
-      {:ok, %{rows: rows, columns: columns}} ->
-        changes =
-          rows
-          |> Enum.map(&row_to_map(columns, &1))
-          |> Enum.map(&Change.from_row(capture_instance, &1))
+    with {:ok, max_lsn} <- get_max_lsn(conn),
+         true <- lsn_before?(from_lsn, max_lsn) or {:ok, []},
+         {:ok, inc_lsn} <- get_increment_lsn(conn, from_lsn) do
+      query = Lsn.all_changes_query(capture_instance, inc_lsn, max_lsn)
 
-        {:ok, changes}
+      Logger.debug("Query: #{query}")
 
-      {:error, reason} ->
-        {:error, reason}
+      case Tds.query(conn, query, []) do
+        {:ok, %{rows: nil}} ->
+          Logger.debug("Fetch result for #{capture_instance}: rows is nil (no changes)")
+          {:ok, []}
+
+        {:ok, %{rows: rows, columns: columns}} when is_list(rows) ->
+          Logger.debug("Fetch result for #{capture_instance}: #{length(rows)} row(s)")
+          if rows != [] do
+            Logger.debug("Columns: #{inspect(columns)}")
+            Logger.debug("First row: #{inspect(hd(rows))}")
+          end
+
+          changes =
+            rows
+            |> Enum.map(&row_to_map(columns, &1))
+            |> Enum.map(&Change.from_row(capture_instance, &1))
+
+          {:ok, changes}
+
+        {:ok, result} ->
+          Logger.warning("Unexpected result format for #{capture_instance}: #{inspect(result)}")
+          {:ok, []}
+
+        {:error, reason} ->
+          Logger.warning("Query error for #{capture_instance}: #{inspect(reason)}")
+          {:error, reason}
+      end
     end
+  end
+
+  defp lsn_before?(lsn_a, lsn_b) do
+    Lsn.compare(lsn_a, lsn_b) == :lt
   end
 
   @doc """
@@ -80,6 +113,19 @@ defmodule TdsCdc.Capture do
   @spec get_max_lsn(GenServer.server()) :: {:ok, binary()} | {:error, term()}
   def get_max_lsn(conn) do
     query = Lsn.max_lsn_query()
+
+    case Tds.query(conn, query, []) do
+      {:ok, %{rows: [[lsn]]}} -> {:ok, lsn}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Gets the next LSN after the given one.
+  """
+  @spec get_increment_lsn(GenServer.server(), binary()) :: {:ok, binary()} | {:error, term()}
+  def get_increment_lsn(conn, from_lsn) do
+    query = Lsn.increment_lsn_query(from_lsn)
 
     case Tds.query(conn, query, []) do
       {:ok, %{rows: [[lsn]]}} -> {:ok, lsn}

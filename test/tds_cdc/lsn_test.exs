@@ -31,6 +31,17 @@ defmodule TdsCdc.LsnTest do
     end
   end
 
+  describe "increment_lsn_query/1" do
+    test "generates correct SQL to increment an LSN" do
+      lsn = <<0, 0, 0, 40, 0, 0, 1, 32, 0, 1>>
+
+      query = Lsn.increment_lsn_query(lsn)
+
+      assert query =~ "sys.fn_cdc_increment_lsn"
+      assert query =~ "00000028000001200001"
+    end
+  end
+
   describe "all_changes_query/3" do
     test "generates correct SQL for all changes query" do
       from_lsn = <<0, 0, 0, 1, 0, 0, 0, 1, 0, 1>>
@@ -40,6 +51,35 @@ defmodule TdsCdc.LsnTest do
 
       assert query =~ "cdc.fn_cdc_get_all_changes_dbo_Users"
       assert query =~ "'all'"
+    end
+  end
+
+  describe "compare/2" do
+    test "returns :lt when first LSN is less than second" do
+      lsn_a = <<0, 0, 0, 1, 0, 0, 0, 0, 0, 1>>
+      lsn_b = <<0, 0, 0, 2, 0, 0, 0, 0, 0, 1>>
+
+      assert Lsn.compare(lsn_a, lsn_b) == :lt
+    end
+
+    test "returns :gt when first LSN is greater than second" do
+      lsn_a = <<0, 0, 0, 2, 0, 0, 0, 0, 0, 1>>
+      lsn_b = <<0, 0, 0, 1, 0, 0, 0, 0, 0, 1>>
+
+      assert Lsn.compare(lsn_a, lsn_b) == :gt
+    end
+
+    test "returns :eq when LSNs are equal" do
+      lsn = <<0, 0, 0, 42, 0, 0, 1, 32, 0, 1>>
+
+      assert Lsn.compare(lsn, lsn) == :eq
+    end
+
+    test "compares LSNs that differ only in later bytes" do
+      lsn_a = <<0, 0, 0, 1, 0, 0, 0, 0, 0, 1>>
+      lsn_b = <<0, 0, 0, 1, 0, 0, 0, 0, 0, 2>>
+
+      assert Lsn.compare(lsn_a, lsn_b) == :lt
     end
   end
 end

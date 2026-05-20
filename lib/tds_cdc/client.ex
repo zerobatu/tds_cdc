@@ -9,7 +9,9 @@ defmodule TdsCdc.Client do
 
   use GenServer
 
-  alias TdsCdc.Capture
+  require Logger
+
+  alias TdsCdc.{Capture, Lsn}
 
   @default_poll_interval 1_000
 
@@ -30,8 +32,8 @@ defmodule TdsCdc.Client do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
-    name = Keyword.get(opts, :name)
-    GenServer.start_link(__MODULE__, opts, name: name)
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, Keyword.put(opts, :name, name), name: name)
   end
 
   @spec start_link(keyword(), GenServer.server()) :: GenServer.on_start()
@@ -121,8 +123,10 @@ defmodule TdsCdc.Client do
     if capture_instance in state.capture_instances do
       subscribers = Map.update(state.subscribers, capture_instance, [pid], &[pid | &1])
       Process.monitor(pid)
+      Logger.info("Process #{inspect(pid)} subscribed to #{capture_instance}")
       {:reply, :ok, %{state | subscribers: subscribers}}
     else
+      Logger.warning("Subscribe failed: capture instance #{capture_instance} not found")
       {:reply, {:error, :not_found}, state}
     end
   end
@@ -149,30 +153,37 @@ defmodule TdsCdc.Client do
   def handle_info(:connect, state) do
     case Tds.start_link(state.conn_opts) do
       {:ok, conn} ->
+        Logger.info("Connected to SQL Server")
         lsn_positions = initialize_lsn_positions(conn, state.capture_instances)
         timer_ref = schedule_poll(state.poll_interval)
 
-        {:noreply, %{state | conn: conn, lsn_positions: lsn_positions, timer_ref: timer_ref}}
+        state = %{state | conn: conn, lsn_positions: lsn_positions, timer_ref: timer_ref}
+        Logger.info("LSN positions initialized: #{inspect_lsn_positions(lsn_positions)}")
+        {:noreply, state}
 
-      {:error, _reason} ->
+      {:error, reason} ->
+        Logger.warning("Failed to connect to SQL Server: #{inspect(reason)}. Retrying in 5s...")
         Process.send_after(self(), :connect, 5_000)
         {:noreply, state}
     end
   end
 
   def handle_info(:poll, %{conn: conn} = state) when not is_nil(conn) do
+    Logger.debug("Poll cycle started for #{inspect(state.capture_instances)}")
     state = poll_changes(state, conn)
     timer_ref = schedule_poll(state.poll_interval)
     {:noreply, %{state | timer_ref: timer_ref}}
   end
 
   def handle_info(:poll, state) do
+    Logger.warning("Poll triggered but no connection. Reconnecting...")
     send(self(), :connect)
     timer_ref = schedule_poll(state.poll_interval)
     {:noreply, %{state | timer_ref: timer_ref}}
   end
 
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
+    Logger.info("Subscriber #{inspect(pid)} exited, removing from lists")
     subscribers =
       Map.new(state.subscribers, fn {ci, pids} ->
         {ci, List.delete(pids, pid)}
@@ -182,9 +193,15 @@ defmodule TdsCdc.Client do
   end
 
   def handle_info({:tds_disconnected, _conn_pid}, state) do
+    Logger.warning("TDS connection lost. Reconnecting...")
     if state.conn, do: GenServer.stop(state.conn)
     send(self(), :connect)
     {:noreply, %{state | conn: nil, timer_ref: nil}}
+  end
+
+  def handle_info(msg, state) do
+    Logger.debug("Received unexpected message: #{inspect(msg)}")
+    {:noreply, state}
   end
 
   @impl true
@@ -198,11 +215,22 @@ defmodule TdsCdc.Client do
     Process.send_after(self(), :poll, interval)
   end
 
+  defp inspect_lsn_positions(positions) do
+    positions
+    |> Enum.map(fn {ci, lsn} -> "#{ci}: #{Lsn.to_hex(lsn)}" end)
+    |> Enum.join(", ")
+  end
+
   defp initialize_lsn_positions(conn, capture_instances) do
     Enum.reduce(capture_instances, %{}, fn ci, acc ->
       case Capture.get_min_lsn(conn, ci) do
-        {:ok, lsn} -> Map.put(acc, ci, lsn)
-        {:error, _} -> acc
+        {:ok, lsn} ->
+          Logger.info("Initialized LSN for #{ci}: #{Lsn.to_hex(lsn)}")
+          Map.put(acc, ci, lsn)
+
+        {:error, reason} ->
+          Logger.warning("Failed to get min LSN for #{ci}: #{inspect(reason)}")
+          acc
       end
     end)
   end
@@ -211,27 +239,66 @@ defmodule TdsCdc.Client do
     Enum.reduce(state.capture_instances, state, fn ci, acc ->
       case Map.get(acc.lsn_positions, ci) do
         nil ->
+          Logger.warning("No LSN position for #{ci}, skipping")
           acc
 
         from_lsn ->
-          case Capture.fetch_changes(conn, ci, from_lsn) do
-            {:ok, []} ->
-              acc
+          with {:ok, min_lsn} <- Capture.get_min_lsn(conn, ci),
+               :lt <- Lsn.compare(from_lsn, min_lsn) do
+            publish_gap_detected(ci, from_lsn, min_lsn, acc.subscribers)
+            acc = put_in(acc.lsn_positions[ci], min_lsn)
+            fetch_and_publish(conn, ci, min_lsn, acc)
+          else
+            {:error, reason} ->
+              Logger.warning("Failed to get min LSN for #{ci}: #{inspect(reason)}")
+              fetch_and_publish(conn, ci, from_lsn, acc)
 
-            {:ok, changes} ->
-              publish_changes(ci, changes, acc.subscribers)
-              last_lsn = extract_last_lsn(changes)
-              put_in(acc.lsn_positions[ci], last_lsn)
-
-            {:error, _reason} ->
-              acc
+            _ ->
+              fetch_and_publish(conn, ci, from_lsn, acc)
           end
       end
     end)
   end
 
+  defp fetch_and_publish(conn, ci, from_lsn, acc) do
+    case Capture.fetch_changes(conn, ci, from_lsn) do
+      {:ok, []} ->
+        acc
+
+      {:ok, changes} ->
+        Logger.info("Fetched #{length(changes)} change(s) for #{ci}")
+        publish_changes(ci, changes, acc.subscribers)
+        case extract_last_lsn(changes) do
+          nil -> acc
+          last_lsn -> put_in(acc.lsn_positions[ci], last_lsn)
+        end
+
+      {:error, reason} ->
+        Logger.warning("Failed to fetch changes for #{ci}: #{inspect(reason)}")
+        acc
+    end
+  end
+
+  defp publish_gap_detected(capture_instance, from_lsn, min_lsn, subscribers) do
+    subscribers_for_ci = Map.get(subscribers, capture_instance, [])
+
+    Enum.each(subscribers_for_ci, fn pid ->
+      send(pid, {:tds_cdc_gap_detected, capture_instance, from_lsn, min_lsn})
+    end)
+
+    Logger.warning(
+      "CDC gap detected for #{capture_instance}: stored LSN #{Lsn.to_hex(from_lsn)} " <>
+        "is behind min LSN #{Lsn.to_hex(min_lsn)}. Resetting position. " <>
+        "Some changes may have been lost due to CDC retention cleanup."
+    )
+  end
+
   defp publish_changes(capture_instance, changes, subscribers) do
     subscribers_for_ci = Map.get(subscribers, capture_instance, [])
+
+    if subscribers_for_ci == [] do
+      Logger.debug("No subscribers for #{capture_instance}, #{length(changes)} change(s) dropped")
+    end
 
     Enum.each(subscribers_for_ci, fn pid ->
       Enum.each(changes, fn change ->
