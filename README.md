@@ -57,6 +57,8 @@ GO
 
 This creates a **capture instance** named `dbo_users` and a table `cdc.dbo_users_CT` where SQL Server stores the changes.
 
+The capture instance name follows the pattern `<schema>_<table>` — so `dbo.users` becomes `dbo_users`. You use this name everywhere in TdsCdc: `capture_instances: ["dbo_users"]`, `TdsCdc.subscribe("dbo_users")`, etc. You can also specify a custom name via `@capture_instance` when enabling CDC.
+
 ## Connection adapters
 
 TdsCdc supports two connection modes:
@@ -134,11 +136,15 @@ end
 
 ### Query current LSN position
 
+The LSN (Log Sequence Number) position indicates how far the client has processed changes in the SQL Server transaction log. Use this to check which changes have already been delivered.
+
 ```elixir
 {:ok, lsn} = TdsCdc.current_lsn("dbo_users")
 ```
 
 ### Stop the client
+
+Gracefully stops the CDC client process, cancels its polling timer, and (if using `:conn`) closes the database connection. Subscribers will no longer receive change events.
 
 ```elixir
 :ok = TdsCdc.stop()
@@ -166,6 +172,66 @@ GenServer.stop(conn)
 {:ok, pid} = TdsCdc.start_link(conn: conn_opts, capture_instances: ["dbo_users"])
 :ok = TdsCdc.wait_for_ready(timeout: 10_000, capture_instance: "dbo_users")
 TdsCdc.subscribe("dbo_users")
+```
+
+## LSN persistence
+
+By default, TdsCdc persists LSN positions to disk so they survive application restarts. When the client starts, it loads saved positions and resumes from where it left off (provided the positions are still within the CDC retention window).
+
+### Default: file-based persistence
+
+Positions are saved as JSON files in `<system_tmp>/tds_cdc/<client_name>.json`:
+
+```elixir
+# Default (automatic)
+TdsCdc.start_link(conn: [...], capture_instances: ["dbo_users"])
+
+# Custom path
+TdsCdc.start_link(
+  conn: [...],
+  capture_instances: ["dbo_users"],
+  persistence: {TdsCdc.Persistence.File, path: "/var/lib/myapp/lsn"}
+)
+```
+
+### Custom persistence module
+
+Implement the `TdsCdc.Persistence` behaviour to store positions in a database, Redis, or any other backend:
+
+```elixir
+defmodule MyApp.DbPersistence do
+  @behaviour TdsCdc.Persistence
+
+  @impl true
+  def save_positions(_name, positions) do
+    # Write positions to your database
+    :ok
+  end
+
+  @impl true
+  def load_positions(name) do
+    # Read positions from your database
+    {:ok, %{}}  # or {:error, :not_found}
+  end
+end
+
+TdsCdc.start_link(
+  conn: [...],
+  capture_instances: ["dbo_users"],
+  persistence: {MyApp.DbPersistence, []}
+)
+```
+
+### Disable persistence
+
+If you don't need positions to survive restarts:
+
+```elixir
+TdsCdc.start_link(
+  conn: [...],
+  capture_instances: ["dbo_users"],
+  persistence: nil
+)
 ```
 
 ## Multiple instances
@@ -226,6 +292,10 @@ end
 > **Note on UPDATE operations:** CDC records operation=3 (before image) and operation=4 (after image). Both are mapped to `:update`.
 
 ## Architecture
+
+When you enable CDC on a table (e.g. `dbo.users`), SQL Server creates a **change table** named `cdc.<schema>_<table>_CT` (e.g. `cdc.dbo_users_CT`). The SQL Server Agent (CDC capture job) reads the transaction log and populates these `_CT` tables with every INSERT, UPDATE, and DELETE as they occur. Each `_CT` row includes metadata columns (`__$operation`, `__$start_lsn`, `__$seqval`) plus all the tracked table's columns.
+
+TdsCdc periodically queries these `_CT` tables using the `sys.fn_cdc_get_all_changes_*` function, starting from the last LSN it processed. It advances the LSN position after each poll so no change is delivered twice.
 
 ```
 SQL Server                          Elixir - TdsCdc
@@ -338,6 +408,8 @@ Spins up SQL Server 2022 with CDC enabled, a web app with CRUD for users on port
 | `TdsCdc.Connection.Ecto` | Ecto.Repo connection adapter |
 | `TdsCdc.Change` | Struct representing a change event |
 | `TdsCdc.Lsn` | Utilities for Log Sequence Numbers |
+| `TdsCdc.Persistence` | Behaviour for LSN position persistence |
+| `TdsCdc.Persistence.File` | Default file-based LSN persistence |
 
 ## License
 

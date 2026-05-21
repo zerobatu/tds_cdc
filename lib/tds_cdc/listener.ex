@@ -163,7 +163,7 @@ defmodule TdsCdc.Listener do
 
         cdc_opts =
           opts
-          |> Keyword.take([:conn, :repo, :capture_instances, :poll_interval])
+          |> Keyword.take([:conn, :repo, :capture_instances, :poll_interval, :persistence])
           |> Keyword.put(:name, cdc_client_name)
 
         case TdsCdc.Client.start_link(cdc_opts) do

@@ -57,6 +57,33 @@ defmodule TdsCdc.Lsn do
   end
 
   @doc """
+  Converts a hex string representation back to a binary LSN.
+
+  Accepts both the colon-separated format (`"0x00000028:00000120:0001"`)
+  and the plain hex format (`"0x00000028000001200001"`).
+
+  ## Examples
+
+      iex> TdsCdc.Lsn.from_hex("0x00000028:00000120:0001")
+      <<0, 0, 0, 40, 0, 0, 1, 32, 0, 1>>
+
+      iex> TdsCdc.Lsn.from_hex("0x00000028000001200001")
+      <<0, 0, 0, 40, 0, 0, 1, 32, 0, 1>>
+  """
+  @spec from_hex(String.t()) :: binary()
+  def from_hex("0x" <> hex) do
+    hex
+    |> String.replace(":", "")
+    |> Base.decode16!()
+  end
+
+  def from_hex(hex) do
+    hex
+    |> String.replace(":", "")
+    |> Base.decode16!()
+  end
+
+  @doc """
   Returns the SQL query to get the minimum LSN for a given capture instance.
 
   This is used to start reading changes from the beginning of available

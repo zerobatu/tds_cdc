@@ -21,14 +21,16 @@ defmodule TdsCdc.Client do
 
   require Logger
 
-  alias TdsCdc.{Change, Connection, Lsn}
+  alias TdsCdc.{Change, Connection, Lsn, Persistence}
 
   @default_poll_interval 1_000
   @connect_retry_interval 2_000
+  @default_persistence {Persistence.File, []}
 
   defstruct [
     :conn,
     :adapter,
+    :persistence,
     conn_opts: nil,
     repo: nil,
     capture_instances: [],
@@ -51,6 +53,8 @@ defmodule TdsCdc.Client do
     * `:capture_instances` - List of CDC capture instance names to track (required).
     * `:poll_interval` - Interval in ms to poll for changes (default: 1000).
     * `:name` - GenServer name registration (default: `TdsCdc.Client`).
+    * `:persistence` - How to persist LSN positions across restarts.
+      Can be `{module, opts}` tuple or `nil` to disable. Default: `{TdsCdc.Persistence.File, []}`.
 
   ## Examples
 
@@ -64,6 +68,20 @@ defmodule TdsCdc.Client do
       {:ok, pid} = TdsCdc.start_link(
         repo: MyApp.Repo,
         capture_instances: ["dbo_users"]
+      )
+
+      # With custom persistence path
+      {:ok, pid} = TdsCdc.start_link(
+        conn: [...],
+        capture_instances: ["dbo_users"],
+        persistence: {TdsCdc.Persistence.File, path: "/var/lib/myapp/lsn"}
+      )
+
+      # Disable persistence (positions lost on restart)
+      {:ok, pid} = TdsCdc.start_link(
+        conn: [...],
+        capture_instances: ["dbo_users"],
+        persistence: nil
       )
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -143,6 +161,7 @@ defmodule TdsCdc.Client do
     repo = Keyword.get(opts, :repo)
     capture_instances = Keyword.get(opts, :capture_instances, [])
     poll_interval = Keyword.get(opts, :poll_interval, @default_poll_interval)
+    persistence = parse_persistence(opts)
 
     case {conn_opts, repo} do
       {nil, nil} ->
@@ -158,6 +177,7 @@ defmodule TdsCdc.Client do
           conn_opts: enriched_opts,
           capture_instances: capture_instances,
           poll_interval: poll_interval,
+          persistence: persistence,
           owns_conn?: true
         }
 
@@ -171,11 +191,20 @@ defmodule TdsCdc.Client do
           conn: repo,
           capture_instances: capture_instances,
           poll_interval: poll_interval,
+          persistence: persistence,
           owns_conn?: false
         }
 
         send(self(), :init_lsn)
         {:ok, state}
+    end
+  end
+
+  defp parse_persistence(opts) do
+    case Keyword.get(opts, :persistence, @default_persistence) do
+      nil -> nil
+      {mod, mod_opts} when is_atom(mod) -> {mod, mod_opts}
+      mod when is_atom(mod) -> {mod, []}
     end
   end
 
@@ -189,13 +218,29 @@ defmodule TdsCdc.Client do
   defp connect_with_retry(adapter, opts) do
     case adapter.start_link(opts) do
       {:ok, conn} ->
-        Logger.info("Connected to SQL Server")
-        conn
+        case verify_connection(adapter, conn) do
+          :ok ->
+            Logger.info("Connected to SQL Server")
+            conn
+
+          {:error, reason} ->
+            Logger.warning("Connection established but not ready: #{inspect(reason)}. Retrying in #{@connect_retry_interval}ms...")
+            adapter.stop(conn)
+            Process.sleep(@connect_retry_interval)
+            connect_with_retry(adapter, opts)
+        end
 
       {:error, reason} ->
         Logger.warning("Failed to connect to SQL Server: #{inspect(reason)}. Retrying in #{@connect_retry_interval}ms...")
         Process.sleep(@connect_retry_interval)
         connect_with_retry(adapter, opts)
+    end
+  end
+
+  defp verify_connection(adapter, conn) do
+    case adapter.query(conn, "SELECT 1 AS ok", []) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -232,7 +277,7 @@ defmodule TdsCdc.Client do
 
   @impl true
   def handle_info(:init_lsn, state) do
-    lsn_positions = initialize_lsn_positions(state)
+    lsn_positions = load_or_init_lsn_positions(state)
     timer_ref = schedule_poll(state.poll_interval)
 
     state = %{state | lsn_positions: lsn_positions, timer_ref: timer_ref}
@@ -259,6 +304,7 @@ defmodule TdsCdc.Client do
 
   def handle_info(:poll, state) do
     state = poll_changes(state)
+    persist_positions(state)
     timer_ref = schedule_poll(state.poll_interval)
     {:noreply, %{state | timer_ref: timer_ref}}
   end
@@ -293,6 +339,7 @@ defmodule TdsCdc.Client do
   @impl true
   def terminate(_reason, state) do
     if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
+    persist_positions(state)
     if state.owns_conn? and state.conn, do: Connection.Tds.stop(state.conn)
     :ok
   end
@@ -327,6 +374,96 @@ defmodule TdsCdc.Client do
           acc
       end
     end)
+  end
+
+  defp load_or_init_lsn_positions(state) do
+    case state.persistence do
+      nil ->
+        initialize_lsn_positions(state)
+
+      {mod, _mod_opts} ->
+        client_name = client_name(state)
+        loaded = load_persistent_positions(mod, client_name)
+        merge_with_min_lsns(state, loaded)
+    end
+  end
+
+  defp client_name(state) do
+    case Process.info(self(), :registered_name) do
+      {:registered_name, name} -> name
+      _ -> state.__struct__
+    end
+  end
+
+  defp load_persistent_positions(mod, client_name) do
+    case mod.load_positions(client_name) do
+      {:ok, positions} ->
+        Logger.info("Loaded LSN positions from persistence for #{inspect(client_name)}")
+        positions
+
+      {:error, :not_found} ->
+        Logger.info("No saved LSN positions found, starting from min LSN")
+        %{}
+
+      {:error, reason} ->
+        Logger.warning("Failed to load LSN positions: #{inspect(reason)}, starting from min LSN")
+        %{}
+    end
+  end
+
+  defp merge_with_min_lsns(state, loaded) do
+    Enum.reduce(state.capture_instances, %{}, fn ci, acc ->
+      case Map.get(loaded, ci) do
+        nil ->
+          case query(state, Lsn.min_lsn_query(ci), []) do
+            {:ok, %{rows: [[lsn]]}} ->
+              Logger.info("No saved LSN for #{ci}, using min LSN: #{Lsn.to_hex(lsn)}")
+              Map.put(acc, ci, lsn)
+
+            _ ->
+              Logger.warning("Could not get min LSN for #{ci}")
+              acc
+          end
+
+        saved_lsn ->
+          case query(state, Lsn.min_lsn_query(ci), []) do
+            {:ok, %{rows: [[min_lsn]]}} ->
+              case Lsn.compare(saved_lsn, min_lsn) do
+                :lt ->
+                  Logger.warning(
+                    "Saved LSN for #{ci} (#{Lsn.to_hex(saved_lsn)}) is behind min LSN (#{Lsn.to_hex(min_lsn)}). " <>
+                      "Resetting to min LSN to avoid gap."
+                  )
+                  Map.put(acc, ci, min_lsn)
+
+                _ ->
+                  Logger.info("Restored LSN for #{ci}: #{Lsn.to_hex(saved_lsn)}")
+                  Map.put(acc, ci, saved_lsn)
+              end
+
+            _ ->
+              Logger.info("Using saved LSN for #{ci}: #{Lsn.to_hex(saved_lsn)}")
+              Map.put(acc, ci, saved_lsn)
+          end
+      end
+    end)
+  end
+
+  defp persist_positions(state) do
+    case state.persistence do
+      nil -> :ok
+      {mod, _mod_opts} ->
+        client_name = client_name(state)
+        case mod.save_positions(client_name, state.lsn_positions) do
+          :ok ->
+            Logger.debug("Persisted LSN positions for #{inspect(client_name)}")
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("Failed to persist LSN positions: #{inspect(reason)}")
+            :ok
+        end
+    end
   end
 
   defp poll_changes(state) do
