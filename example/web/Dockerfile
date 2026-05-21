@@ -7,12 +7,9 @@ RUN apt-get update -qq && \
 WORKDIR /app
 
 COPY mix.exs ./
-COPY mix.lock ./
 COPY config config
 COPY lib lib
 
 RUN mix deps.get && mix compile
 
-COPY examples/docker/app/example.exs example.exs
-
-CMD ["mix", "run", "example.exs"]
+CMD ["mix", "run", "--no-halt"]

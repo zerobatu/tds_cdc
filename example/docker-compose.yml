@@ -1,7 +1,7 @@
 services:
   sqlserver:
     image: mcr.microsoft.com/mssql/server:2022-latest
-    container_name: tds_cdc_sqlserver
+    container_name: cdc_example_sqlserver
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
@@ -18,7 +18,7 @@ services:
 
   sqlserver-init:
     image: mcr.microsoft.com/mssql/server:2022-latest
-    container_name: tds_cdc_init
+    container_name: cdc_example_init
     depends_on:
       sqlserver:
         condition: service_healthy
@@ -32,11 +32,29 @@ services:
       - ./sqlserver/entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
 
-  app:
+  web:
     build:
-      context: ../..
-      dockerfile: examples/docker/app/Dockerfile
-    container_name: tds_cdc_app
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: cdc_example_web
+    depends_on:
+      sqlserver-init:
+        condition: service_completed_successfully
+    ports:
+      - "4000:4000"
+    environment:
+      TDS_HOST: sqlserver
+      TDS_PORT: "1433"
+      TDS_USERNAME: sa
+      TDS_PASSWORD: "YourStrong!Passw0rd"
+      TDS_DATABASE: cdc_example
+      WEB_PORT: "4000"
+
+  listener:
+    build:
+      context: ../
+      dockerfile: example/listener/Dockerfile
+    container_name: cdc_example_listener
     depends_on:
       sqlserver-init:
         condition: service_completed_successfully
@@ -45,4 +63,4 @@ services:
       TDS_PORT: "1433"
       TDS_USERNAME: sa
       TDS_PASSWORD: "YourStrong!Passw0rd"
-      TDS_DATABASE: cdc_test
+      TDS_DATABASE: cdc_example
