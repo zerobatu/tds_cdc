@@ -7,7 +7,13 @@ defmodule TdsCdc.MixProject do
       version: "0.1.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      description: "Change Data Capture library for SQL Server in Elixir via TDS protocol",
+      package: package(),
+      docs: [
+        main: "TdsCdc",
+        extras: ["README.md"]
+      ]
     ]
   end
 
@@ -18,10 +24,22 @@ defmodule TdsCdc.MixProject do
     ]
   end
 
+  defp package do
+    [
+      name: "tds_cdc",
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE),
+      licenses: ["MIT"],
+      links: %{
+        "GitHub" => "https://github.com/carlvarado/tds_cdc"
+      }
+    ]
+  end
+
   defp deps do
     [
       {:tds, "~> 2.3"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
 end

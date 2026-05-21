@@ -59,6 +59,23 @@ This creates a **capture instance** named `dbo_users` and a table `cdc.dbo_users
 
 The capture instance name follows the pattern `<schema>_<table>` — so `dbo.users` becomes `dbo_users`. You use this name everywhere in TdsCdc: `capture_instances: ["dbo_users"]`, `TdsCdc.subscribe("dbo_users")`, etc. You can also specify a custom name via `@capture_instance` when enabling CDC.
 
+> **Warning — Schema changes are not propagated to CDC tables.** If you add or remove columns from the source table (`dbo.users`), the `_CT` table will **not** reflect the new schema. You must either:
+>
+> 1. **Disable and re-enable CDC** — all historical change data is lost:
+>
+>       ```sql
+>       EXEC sys.sp_cdc_disable_table @source_schema = N'dbo', @source_name = N'users', @capture_instance = N'dbo_users';
+>       EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'users', @role_name = NULL;
+>       ```
+>
+> 2. **Create a second capture instance** — keeps the old one alive during transition:
+>
+>       ```sql
+>       EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'users', @capture_instance = N'dbo_users_v2', @role_name = NULL;
+>       ```
+>
+>    Then switch TdsCdc to `capture_instances: ["dbo_users_v2"]` and disable the old instance when ready.
+
 ## Connection adapters
 
 TdsCdc supports two connection modes:
