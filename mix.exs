@@ -30,7 +30,7 @@ defmodule TdsCdc.MixProject do
       files: ~w(lib .formatter.exs mix.exs README.md LICENSE),
       licenses: ["MIT"],
       links: %{
-        "GitHub" => "https://github.com/carlvarado/tds_cdc"
+        "GitHub" => "https://github.com/zerobatu/tds_cdc"
       }
     ]
   end
